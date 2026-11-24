@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- VARA FM autotune, the asking side: ten record 0 frames at drives from -30 to
+  0 dB to another station, which answers with the one it heard best and its
+  S/N; xara then uses that drive. Frames, steps and timing are VARA FM 4.4.1's
+  own (byte for byte, and its audio to 16-bit precision, from on-air
+  recordings with HB9AK-4); tried against VARA FM over virtual cables. In the
+  Windows app (*Autotune with*, FM modes) and the web UI's
+  control commands (`AUTOTUNE CALL`); the result is in the status message
+  (`autotune`). Answering another station's autotune isn't done yet
+
 - Windows and Mac/iPhone audio: a loop turn that runs long (decoding a big
   frame) no longer cuts the audio still coming in. Playback runs dry for it,
   and that used to be made up by dropping captured audio, which mostly lost

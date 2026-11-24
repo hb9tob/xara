@@ -41,6 +41,27 @@ pub enum Report {
     Trace(String),
     Line(String),
     Kiss(Command, Vec<u8>),
+    Autotune(Autotune),
+}
+
+/// How an autotune (VARA FM's automatic drive setting) went.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Autotune {
+    /// The ten steps are on the air; the answer is due within AUTOTUNE_WAIT.
+    Sent {
+        peer: String,
+    },
+    /// The other station picked `step` (1-10), which is `drive_db`, now in use.
+    Done {
+        peer: String,
+        step: u8,
+        drive_db: f64,
+        snr_db: f64,
+        verdict: u8,
+    },
+    NoReply {
+        peer: String,
+    },
 }
 
 pub trait HostConfig: Clone {
@@ -134,6 +155,12 @@ pub trait Modem {
     fn set_bw(&mut self, bw: Bw) -> bool;
     fn set_p2p(&mut self, on: bool);
     fn set_kiss_rx(&mut self, on: bool);
+
+    /// Start an autotune with `peer`: Err says why not (only VARA FM has one, and it needs a
+    /// quiet, idle modem).
+    fn autotune(&mut self, _peer: &str) -> Result<(), String> {
+        Err("autotune is for VARA FM".into())
+    }
 
     fn drain(&mut self) {
         let now = self.now();

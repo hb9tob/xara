@@ -43,6 +43,11 @@ bool xara_tune(bool on);
 // to set the radio's ALC. Returns false when the modem isn't running.
 bool xara_set_drive(double db);
 
+// VARA FM's autotune with the station peer (a call sign): ten frames at drives from
+// -30 to 0 dB, and the drive that station picks becomes the drive. The progress and result
+// show in the web UI's status ("autotune"). Returns false when the modem isn't running.
+bool xara_autotune(const char *peer);
+
 // Copies the next line xara logged into buf (NUL-terminated, cut to fit).
 // Returns false when no line is waiting. Lines are also kept on stderr.
 bool xara_next_log(char *buf, size_t cap);

@@ -137,6 +137,12 @@ pub fn set_drive(db: f64) -> bool {
     xara::daemon::app_control(xara_ui::telemetry::Control::Drive(db))
 }
 
+/// VARA FM's autotune with `peer`: the result shows in the web UI's status ("autotune").
+pub fn autotune(peer: &str) -> bool {
+    xara_ui::telemetry::CallSign::new(peer)
+        .is_some_and(|c| xara::daemon::app_control(xara_ui::telemetry::Control::Autotune(c)))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn xara_tune(on: bool) -> bool {
     tune(on)
@@ -145,6 +151,13 @@ pub extern "C" fn xara_tune(on: bool) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn xara_set_drive(db: f64) -> bool {
     set_drive(db)
+}
+
+/// # Safety
+/// `peer` must be null or a valid NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xara_autotune(peer: *const c_char) -> bool {
+    !peer.is_null() && autotune(&unsafe { CStr::from_ptr(peer) }.to_string_lossy())
 }
 
 pub fn next_log() -> Option<String> {

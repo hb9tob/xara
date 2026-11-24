@@ -1,7 +1,7 @@
 use crate::bus::Source;
 use crate::messages::{self, Info};
 use crate::settings::{self, Settings};
-use crate::telemetry::{Control, Controller, Feed};
+use crate::telemetry::{CallSign, Control, Controller, Feed};
 use crate::waterfall::Waterfall;
 use crate::ws;
 use std::collections::VecDeque;
@@ -594,10 +594,13 @@ fn command(text: &str) -> Option<Cmd<'_>> {
         "DEVICES ?" => Cmd::Settings(Query::Devices),
         "SETTINGS SAVE" => Cmd::Settings(Query::Save(body)),
         "SETTINGS RESET" => Cmd::Settings(Query::Reset),
-        l => {
-            let db = l.strip_prefix("DRIVE ")?.trim().parse::<f64>().ok().filter(|db| db.is_finite())?;
-            Cmd::Control(Control::Drive(db))
-        }
+        l => match l.strip_prefix("AUTOTUNE ") {
+            Some(call) => Cmd::Control(Control::Autotune(CallSign::new(call)?)),
+            None => {
+                let db = l.strip_prefix("DRIVE ")?.trim().parse::<f64>().ok().filter(|db| db.is_finite())?;
+                Cmd::Control(Control::Drive(db))
+            }
+        },
     })
 }
 
@@ -608,6 +611,7 @@ fn label(c: Control) -> String {
         Control::Abort => "abort".into(),
         Control::Restart => "restart".into(),
         Control::Left => "left".into(),
+        Control::Autotune(call) => format!("autotune {}", call.as_str()),
     }
 }
 
@@ -741,6 +745,9 @@ mod tests {
         assert_eq!(command("ABORT"), Some(Cmd::Control(Control::Abort)));
         assert_eq!(command("RESTART"), Some(Cmd::Control(Control::Restart)));
         assert_eq!(command("DRIVE -12.5"), Some(Cmd::Control(Control::Drive(-12.5))));
+        let call = CallSign::new("HB9AK-4").unwrap();
+        assert_eq!(command("autotune hb9ak-4"), Some(Cmd::Control(Control::Autotune(call))));
+        assert_eq!((call.as_str(), command("AUTOTUNE"), command("AUTOTUNE TOO-LONG-CALL")), ("HB9AK-4", None, None));
         assert_eq!(command("SETTINGS ?"), Some(Cmd::Settings(Query::Get)));
         assert_eq!(command("SETTINGS SAVE\nMyCall = a\nb"), Some(Cmd::Settings(Query::Save("MyCall = a\nb"))));
         assert_eq!(label(Control::Drive(-12.5)), "drive -12.5");

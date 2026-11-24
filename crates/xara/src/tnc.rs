@@ -1,5 +1,5 @@
 use crate::rxtext::RxText;
-use crate::station::{HostConfig, Modem, Report, TX_RING_BYTES, secs};
+use crate::station::{Autotune, HostConfig, Modem, Report, TX_RING_BYTES, secs};
 use xara_arq::compression::Compression;
 use xara_arq::host::{HostEvent, LinkBw};
 use xara_arq::kiss;
@@ -9,7 +9,7 @@ use xara_host::kiss::KissServer;
 use xara_host::response::{LinkWidth, Response};
 use xara_host::server::{Host, Input};
 use xara_phy::fm::level::FmBandwidth;
-use xara_ui::telemetry::{Bitrate, Control, Event, Telemetry, UI_TUNE_LIMIT};
+use xara_ui::telemetry::{AutotuneState, Bitrate, Control, Event, Telemetry, UI_TUNE_LIMIT};
 const REGISTERED_AFTER: Time = 5 * SECOND;
 pub const HOST_TUNE_LIMIT: Time = 60 * SECOND;
 pub const RESTART_DELAY: Time = 3 * SECOND / 10;
@@ -53,6 +53,8 @@ pub struct Tnc<M: Modem> {
     modulation: String,
     /// Audio levels for the debug log, when one is kept.
     levels: Option<Levels>,
+    /// The last autotune, as the web UI and the apps show it.
+    autotune: Option<AutotuneState>,
 }
 
 /// One second of audio, summed up for the debug log: is anything reaching the modem?
@@ -111,6 +113,7 @@ impl<M: Modem> Tnc<M> {
             rx: RxText::default(),
             modulation: String::new(),
             levels: None,
+            autotune: None,
         }
     }
 
@@ -304,6 +307,19 @@ impl<M: Modem> Tnc<M> {
                 self.station.abort();
                 ("abort".to_string(), true)
             }
+            Control::Autotune(call) => {
+                let peer = call.as_str().to_string();
+                self.stop_tune();
+                match self.station.autotune(&peer) {
+                    Ok(()) => {
+                        let seq = self.autotune.as_ref().map_or(1, |a| a.seq + 1);
+                        self.autotune =
+                            Some(AutotuneState { seq, peer: peer.clone(), state: "sending", ..Default::default() });
+                        (format!("autotune with {peer}"), true)
+                    }
+                    Err(why) => (format!("autotune with {peer}: {why}"), false),
+                }
+            }
             Control::Restart => {
                 let ok = self.restartable();
                 if ok {
@@ -336,6 +352,9 @@ impl<M: Modem> Tnc<M> {
             s.tx.feed(output);
             (s.ptt, s.busy, s.link, s.retries, s.buffered) = (ptt, busy, link, retries, buffered);
             (s.tuning, s.tune_left, s.drive_db) = (tuning, tune_left, drive_db);
+            if s.autotune != self.autotune {
+                s.autotune.clone_from(&self.autotune);
+            }
             if s.calls != cfg.host().mycalls {
                 s.calls = cfg.host().mycalls.clone();
             }
@@ -542,10 +561,32 @@ impl<M: Modem> Tnc<M> {
         self.say(if ok { Response::Ok } else { Response::Wrong });
     }
 
+    fn autotuned(&mut self, a: Autotune) {
+        let Some(s) = self.autotune.as_mut() else { return };
+        let what = match a {
+            Autotune::Sent { peer } => {
+                s.state = "waiting";
+                format!("autotune sent to {peer}, waiting for the answer")
+            }
+            Autotune::Done { peer, step, drive_db, snr_db, .. } => {
+                (s.state, s.step, s.drive_db, s.snr_db) = ("done", step, Some(drive_db), Some(snr_db));
+                format!("autotune: {peer} picked drive {drive_db} dB (step {step}/10), S/N {snr_db:.1} dB")
+            }
+            Autotune::NoReply { peer } => {
+                s.state = "no reply";
+                format!("autotune: no answer from {peer}")
+            }
+        };
+        self.echo(&format!("  {what}"));
+        xara_host::log::line(format_args!("xara: {what}"));
+        self.emit(|| Event::Control { what, ok: true });
+    }
+
     fn flush(&mut self) {
         while let Some(r) = self.station.pop() {
             match r {
                 Report::Trace(t) => self.trace(&t),
+                Report::Autotune(a) => self.autotuned(a),
                 Report::Ptt(on) => {
                     self.keyed = on;
                     if !self.forced_off {

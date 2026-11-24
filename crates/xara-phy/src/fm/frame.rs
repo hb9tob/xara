@@ -241,3 +241,57 @@ impl Record0 {
         })
     }
 }
+
+/// VARA FM's autotune: the calling station sends ten record 0 frames in one transmission, each
+/// at its own drive (step 1 to 10), and the other station answers with the step it heard best.
+/// The drives are absolute (they don't follow the caller's drive setting), measured on the air
+/// against VARA FM 4.4.1.
+pub const AUTOTUNE_DRIVES_DB: [f64; 10] = [-30.0, -25.0, -21.0, -18.0, -15.0, -12.0, -9.0, -6.0, -3.0, 0.0];
+const AUTOTUNE_CONTROL: u8 = 0x01;
+
+/// One autotune frame: kind 1, no registration or wide bit, the step (1-10) in the info byte,
+/// flags 0, control 0x01, no chain SNR.
+pub fn autotune_request(source: &str, target: &str, step: u8) -> Option<Vec<u8>> {
+    let head = Record0 { kind: Kind::AutoTune, ..Record0::default() }.head();
+    let mut f = vec![head];
+    for c in [source, "", "", target] {
+        f.extend(call_field(c)?);
+    }
+    f.extend([step, 0, AUTOTUNE_CONTROL, 0]);
+    Some(seal(f))
+}
+
+/// The answer to an autotune: a record 0 reply (kind 3) with the S/N the answering station
+/// measured (info byte, 7 per dB) and the step it picked (aux byte, step << 2; the low two bits
+/// were 0 in every reply seen, perhaps a verdict such as VARA's "Low Audio level").
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutotuneReply {
+    pub source: String,
+    pub target: String,
+    pub wide: bool,
+    pub snr_db: f64,
+    pub step: u8,
+    pub verdict: u8,
+}
+
+impl AutotuneReply {
+    pub fn parse(f: &[u8]) -> Option<Self> {
+        let r = Record0::parse(f)?;
+        if r.kind != Kind::Reply {
+            return None;
+        }
+        Some(Self {
+            source: r.source,
+            target: r.target,
+            wide: r.wide,
+            snr_db: f64::from(f[33]) / 7.0,
+            step: f[34] >> 2,
+            verdict: f[34] & 3,
+        })
+    }
+
+    /// The drive the answering station picked, if its step is one of the ten.
+    pub fn drive_db(&self) -> Option<f64> {
+        AUTOTUNE_DRIVES_DB.get(usize::from(self.step).checked_sub(1)?).copied()
+    }
+}

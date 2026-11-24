@@ -3,6 +3,7 @@ use super::constellation::constellation;
 use super::ctrl::data_lead_in;
 use super::level::{Level, Record, qam_pilot};
 use crate::dat::marker_map;
+use crate::fm::frame::{AUTOTUNE_DRIVES_DB, autotune_request};
 use crate::fm::level::FmBandwidth;
 use crate::ofdm::{self, Layout};
 use num_complex::Complex64;
@@ -62,6 +63,10 @@ pub fn tune_block(drive_db: f64) -> Vec<f64> {
 
 pub const CONNECT_LEAD_IN: usize = data_lead_in(23);
 pub const IDLE_BEACON_LEAD_IN: usize = 9;
+/// An autotune frame: 25 lead-in symbols, then record 0's 28 rows (53 symbols, 1.272 s); the
+/// next starts 1.35 s after it. Measured on VARA FM 4.4.1's own output.
+pub const AUTOTUNE_LEAD_IN: usize = 25;
+pub const AUTOTUNE_PERIOD: usize = 64_800;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TxOptions {
@@ -115,6 +120,22 @@ impl Modulator {
         rows.extend(self.rows(record, key, frames));
         let g = l.gain(opt.drive_db) / f64::from(l.amp_norm);
         synth(&rows, g).into_iter().map(|v| v.clamp(-1.0, 1.0)).collect()
+    }
+
+    /// VARA FM's autotune transmission from `source` to `target`: the ten steps of
+    /// AUTOTUNE_DRIVES_DB, each its own record 0 frame at its own drive, one every
+    /// AUTOTUNE_PERIOD samples. None for a call that doesn't fit a record 0.
+    pub fn autotune(&self, source: &str, target: &str, rand: &mut dyn FnMut(u32) -> u32) -> Option<Vec<f64>> {
+        let mut out = Vec::new();
+        for (step, &drive_db) in (1..).zip(&AUTOTUNE_DRIVES_DB) {
+            let f = autotune_request(source, target, step)?;
+            if !out.is_empty() {
+                out.resize(out.len().next_multiple_of(AUTOTUNE_PERIOD), 0.0);
+            }
+            let opt = TxOptions { drive_db, pre_signal: false };
+            out.extend(self.transmission(Record::Connect, 0, &[&f], AUTOTUNE_LEAD_IN, opt, rand));
+        }
+        Some(out)
     }
 }
 

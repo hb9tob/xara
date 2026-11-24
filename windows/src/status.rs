@@ -33,6 +33,21 @@ pub struct Status {
     pub tune_left: f64,
     /// The TX drive the modem uses now (dB)
     pub drive: Option<f64>,
+    /// The last autotune, if any since the modem started
+    pub autotune: Option<Autotune>,
+}
+
+/// VARA FM's autotune as the modem reports it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Autotune {
+    /// Counts autotunes, so a new result can be told from one already taken
+    pub seq: u64,
+    pub peer: String,
+    /// "sending", "waiting", "done" or "no reply"
+    pub state: String,
+    pub step: u64,
+    pub drive: Option<f64>,
+    pub sn: Option<f64>,
 }
 
 impl Status {
@@ -67,6 +82,18 @@ impl Status {
             tuning: b("tuning"),
             tune_left: n("tune_left").unwrap_or(0.0),
             drive: n("drive"),
+            autotune: v.get("autotune").filter(|a| a.is_object()).map(|a| {
+                let u = |k: &str| a.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+                let t = |k: &str| a.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                Autotune {
+                    seq: u("seq"),
+                    peer: t("peer"),
+                    state: t("state"),
+                    step: u("step"),
+                    drive: a.get("drive").and_then(serde_json::Value::as_f64),
+                    sn: a.get("sn").and_then(serde_json::Value::as_f64),
+                }
+            }),
         })
     }
 }
@@ -193,6 +220,13 @@ mod tests {
         assert!(s.ptt && !s.busy && !s.clip && !s.tuning);
         assert_eq!(s.drive, Some(0.0));
         assert!(Status::parse(r#"{"t":"notice","ts":0,"kind":"timed_out"}"#).is_none());
+        assert_eq!(s.autotune, None);
+        let m = m.replace(r#""dropped":0}"#, r#""dropped":0,"autotune":null}"#);
+        assert_eq!(Status::parse(&m).unwrap().autotune, None);
+        let done = r#""autotune":{"seq":2,"peer":"HB9AK-4","state":"done","step":4,"drive":-18,"sn":26.71}}"#;
+        let a = Status::parse(&m.replace(r#""autotune":null}"#, done)).unwrap().autotune.unwrap();
+        assert_eq!((a.seq, a.peer.as_str(), a.state.as_str(), a.step), (2, "HB9AK-4", "done", 4));
+        assert_eq!((a.drive, a.sn), (Some(-18.0), Some(26.71)));
     }
 
     #[test]

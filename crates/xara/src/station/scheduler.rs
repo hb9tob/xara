@@ -8,6 +8,7 @@ pub enum Kind {
     Digi,
     Announce,
     Fragment { last: bool },
+    Autotune,
 }
 
 struct Burst {

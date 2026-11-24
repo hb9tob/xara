@@ -1,6 +1,6 @@
 use crate::json::Obj;
 use crate::settings::{Device, Devices, FILE, Pairs, Settings};
-use crate::telemetry::{Event, METER_FLOOR_DB, Meter, Snapshot, UI_TUNE_LIMIT};
+use crate::telemetry::{AutotuneState, Event, METER_FLOOR_DB, Meter, Snapshot, UI_TUNE_LIMIT};
 use crate::waterfall::{BINS, STEP_DB, WF_FLOOR_DB, Waterfall, span_for};
 use xara_arq::time::{SECOND, Time};
 use xara_host::command::DRIVE_MIN_DB;
@@ -106,7 +106,18 @@ pub(crate) fn status(s: &Snapshot) -> String {
         .int("buffer", s.buffered as u64)
         .strs("calls", &s.calls)
         .int("dropped", s.dropped as u64)
+        .opt_obj("autotune", s.autotune.as_ref().map(autotune))
         .end()
+}
+
+fn autotune(a: &AutotuneState) -> Obj {
+    Obj::new()
+        .int("seq", u64::from(a.seq))
+        .str("peer", &a.peer)
+        .str("state", a.state)
+        .int("step", u64::from(a.step))
+        .opt2("drive", a.drive_db)
+        .opt2("sn", a.snr_db)
 }
 
 pub(crate) fn waterfall(w: &Waterfall) -> String {
@@ -200,7 +211,7 @@ mod tests {
         s.rx.feed(&[0.5; 4]);
         assert_eq!(
             status(&s),
-            r#"{"t":"status","ts":1.5,"rx":{"rms":-6.02,"peak":-6.02,"clip":0},"tx":{"rms":-120,"peak":-120,"clip":0},"ptt":true,"busy":false,"tuning":false,"tune_left":0,"drive":0,"state":"Receiving","level":7,"peer":"N1CALL","bw":"2300","passband":[350,2650],"attempts":0,"retries":0,"afc":null,"sn":11.25,"bitrate":{"level":7,"bps":2412,"tx":false,"modulation":"OFDM 49 carriers · QPSK"},"buffer":0,"calls":["N0CALL"],"dropped":0}"#
+            r#"{"t":"status","ts":1.5,"rx":{"rms":-6.02,"peak":-6.02,"clip":0},"tx":{"rms":-120,"peak":-120,"clip":0},"ptt":true,"busy":false,"tuning":false,"tune_left":0,"drive":0,"state":"Receiving","level":7,"peer":"N1CALL","bw":"2300","passband":[350,2650],"attempts":0,"retries":0,"afc":null,"sn":11.25,"bitrate":{"level":7,"bps":2412,"tx":false,"modulation":"OFDM 49 carriers · QPSK"},"buffer":0,"calls":["N0CALL"],"dropped":0,"autotune":null}"#
         );
     }
 

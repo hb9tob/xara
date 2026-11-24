@@ -88,6 +88,20 @@ pub struct Snapshot {
     pub bitrate: Option<Bitrate>,
     pub calls: Vec<String>,
     pub dropped: usize,
+    pub autotune: Option<AutotuneState>,
+}
+
+/// The last autotune (VARA FM's automatic drive setting): `seq` counts them, so an app can
+/// tell a new result from the one it already took.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AutotuneState {
+    pub seq: u32,
+    pub peer: String,
+    /// "sending", "waiting", "done" or "no reply"
+    pub state: &'static str,
+    pub step: u8,
+    pub drive_db: Option<f64>,
+    pub snr_db: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -106,6 +120,30 @@ pub enum Control {
     Abort,
     Restart,
     Left,
+    Autotune(CallSign),
+}
+
+/// A call sign as a Control carries it: up to 10 ASCII bytes (a VARA call with its SSID).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallSign {
+    bytes: [u8; 10],
+    len: u8,
+}
+
+impl CallSign {
+    pub fn new(call: &str) -> Option<Self> {
+        let call = call.trim();
+        if call.is_empty() || call.len() > 10 || !call.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return None;
+        }
+        let mut bytes = [0; 10];
+        bytes[..call.len()].copy_from_slice(call.to_ascii_uppercase().as_bytes());
+        Some(Self { bytes, len: call.len() as u8 })
+    }
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("")
+    }
 }
 
 type Controls = Arc<Mutex<VecDeque<(u64, Control)>>>;

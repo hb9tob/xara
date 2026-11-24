@@ -1,18 +1,18 @@
 use super::scheduler::{Kind, TxFront};
-use super::{Arq, Common, MIN_GAP, Modem, Options, Report, secs};
+use super::{Arq, Autotune, Common, MIN_GAP, Modem, Options, Report, secs};
 use std::collections::VecDeque;
 use xara_arq::fm::adapt::SNR_OFFSET_DB;
 use xara_arq::fm::broadcast::{self, Received};
 use xara_arq::fm::digi::{DigiListen, DigiOutput, DigiTx};
 use xara_arq::host::HostEvent;
 use xara_arq::rng::XorShift;
-use xara_arq::time::Time;
+use xara_arq::time::{SECOND, Time};
 use xara_arq::{fm, kiss};
 use xara_host::command::Bw;
 use xara_phy::busy::Busy;
 use xara_phy::dsp::quantise;
 use xara_phy::fm::ctrl::{Codebook, Side, frame_audio};
-use xara_phy::fm::frame::parse_data;
+use xara_phy::fm::frame::{AutotuneReply, parse_data};
 use xara_phy::fm::level::{DataLevel, FmBandwidth, Record};
 use xara_phy::fm::rx::FS;
 use xara_phy::fm::rx::receiver::{Event, Receiver, Transmission};
@@ -24,6 +24,14 @@ const WAVEOUT_QUEUE: usize = 200 * 256;
 pub const DATA_OVERHANG: usize = SILENT_TAIL - WAVEOUT_QUEUE;
 const SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 pub const FRAGMENT_GAP: usize = 480;
+/// How long after its last step an autotune waits for the answer (VARA's came 1.2 s after).
+pub const AUTOTUNE_WAIT: Time = 5 * SECOND;
+
+/// An autotune under way: with whom, and once the steps are sent, until when to wait.
+struct Tuning {
+    peer: String,
+    until: Option<Time>,
+}
 
 pub struct Station {
     c: Common<fm::Session>,
@@ -38,6 +46,7 @@ pub struct Station {
     reasm: broadcast::Reassembler,
     kiss_rx: bool,
     ignore_dcd: bool,
+    autotune: Option<Tuning>,
 }
 
 fn bitrate(bw: FmBandwidth, record: Record, tx: bool) -> Report {
@@ -62,6 +71,7 @@ impl Station {
             reasm: broadcast::Reassembler::default(),
             kiss_rx: false,
             ignore_dcd: false,
+            autotune: None,
         };
         s.drain();
         s
@@ -175,6 +185,7 @@ impl Station {
                     _ => {}
                 }
             }
+            Event::Tx(t) if t.record == Record::Connect && self.autotune_reply(&t) => {}
             Event::Tx(t)
                 if self.digi.active()
                     || (t.record == Record::Connect && self.c.session.state() == fm::State::Listen) =>
@@ -203,6 +214,37 @@ impl Station {
             Event::Frame(_) => {}
         }
         self.drain();
+    }
+
+    /// The answer to our autotune, if this is it: the step the other station picked becomes
+    /// the drive.
+    fn autotune_reply(&mut self, t: &Transmission) -> bool {
+        let Some(peer) = self.autotune.as_ref().filter(|a| a.until.is_some()).map(|a| a.peer.clone()) else {
+            return false;
+        };
+        let me = self.c.cfg.host.mycalls.first().cloned().unwrap_or_default();
+        let Some(r) = t.frames.iter().filter(|f| f.ok).find_map(|f| AutotuneReply::parse(&f.bytes)) else {
+            return false;
+        };
+        if !r.source.eq_ignore_ascii_case(&peer) || !r.target.eq_ignore_ascii_case(&me) {
+            return false;
+        }
+        self.autotune = None;
+        let Some(drive_db) = r.drive_db() else {
+            self.c.reports.push_back(Report::Trace(format!("autotune: {peer} answered step {}", r.step)));
+            self.c.reports.push_back(Report::Autotune(Autotune::NoReply { peer }));
+            self.refresh_listen();
+            return true;
+        };
+        self.set_drive(drive_db);
+        self.c.reports.push_back(Report::Trace(format!(
+            "autotune: {peer} picked step {} ({drive_db} dB) at S/N {:.1} dB, verdict {}",
+            r.step, r.snr_db, r.verdict
+        )));
+        let (step, snr_db, verdict) = (r.step, r.snr_db, r.verdict);
+        self.c.reports.push_back(Report::Autotune(Autotune::Done { peer, step, drive_db, snr_db, verdict }));
+        self.refresh_listen();
+        true
     }
 
     fn on_session_data(&mut self, now: Time, t: &Transmission, t_end: Time) {
@@ -317,6 +359,12 @@ impl TxFront for Station {
                 self.c.session.on_tx_done(heard);
                 self.drain_at(end);
             }
+            Kind::Autotune => {
+                if let Some(a) = self.autotune.as_mut() {
+                    a.until = Some(heard + AUTOTUNE_WAIT);
+                    self.c.reports.push_back(Report::Autotune(Autotune::Sent { peer: a.peer.clone() }));
+                }
+            }
             Kind::Announce | Kind::Fragment { .. } => {}
         }
         self.c.tx.release(end, &mut self.c.reports, mark);
@@ -355,6 +403,9 @@ impl Modem for Station {
         self.rx.set_key(l.key);
         let answering = self.c.listen_on || l.linked || self.c.session.state() != fm::State::Listen;
         let mut records: Vec<Record> = if answering { l.records.clone() } else { Vec::new() };
+        if self.autotune.is_some() && !records.contains(&Record::Connect) {
+            records.push(Record::Connect);
+        }
         if !self.digi.call().is_empty()
             && self.c.session.state() == fm::State::Listen
             && !records.contains(&Record::Connect)
@@ -436,6 +487,7 @@ impl Modem for Station {
             && !self.digi.active()
             && self.c.tx.is_empty()
             && self.unproto.is_empty()
+            && self.autotune.is_none()
     }
 
     fn link(&self) -> Link {
@@ -481,6 +533,11 @@ impl Modem for Station {
         }
         if self.digi.next_deadline().is_some_and(|d| d <= self.c.now) {
             self.digi.poll(self.c.now);
+        }
+        if let Some(a) = self.autotune.take_if(|a| a.until.is_some_and(|u| u <= self.c.now)) {
+            self.c.reports.push_back(Report::Trace(format!("autotune: no answer from {}", a.peer)));
+            self.c.reports.push_back(Report::Autotune(Autotune::NoReply { peer: a.peer }));
+            self.refresh_listen();
         }
         self.drain();
         self.send_unproto();
@@ -535,6 +592,35 @@ impl Modem for Station {
     fn set_kiss_rx(&mut self, on: bool) {
         self.kiss_rx = on;
         self.refresh_listen();
+    }
+
+    fn autotune(&mut self, peer: &str) -> Result<(), String> {
+        if !self.idle() || self.c.tx.ptt() {
+            return Err("the modem is busy".into());
+        }
+        if self.c.busy.is_on() && !self.ignore_dcd {
+            return Err("the channel is busy".into());
+        }
+        let peer = peer.trim().to_ascii_uppercase();
+        let me = self.c.cfg.host.mycalls.first().cloned().unwrap_or_default();
+        let bw = self.c.cfg.bw;
+        if self.modm.bw != bw {
+            self.modm = Modulator::new(bw);
+        }
+        let rng = &mut self.rng;
+        let mut r = |n: u32| rng.below(n);
+        let Some(x) = self.modm.autotune(&me, &peer, &mut r) else {
+            return Err(format!("{peer:?} or {me:?} is not a call sign"));
+        };
+        let mut samples: Vec<f64> = x.iter().map(|&v| quantise(v)).collect();
+        samples.resize(samples.len() + DATA_OVERHANG, 0.0);
+        self.c.reports.push_back(Report::Trace(format!("tx autotune {me} -> {peer}, 10 steps")));
+        self.c.tx.stop_tune();
+        let earliest = self.c.tx.after_hold(self.c.now);
+        self.c.tx.push(samples, earliest, Vec::new(), Kind::Autotune);
+        self.autotune = Some(Tuning { peer, until: None });
+        self.refresh_listen();
+        Ok(())
     }
 }
 
@@ -610,6 +696,63 @@ fn passband(bw: FmBandwidth) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `st` for `secs` seconds with `input` as what it hears; returns its reports.
+    fn run(st: &mut Station, input: &[f64], secs: f64) -> Vec<Report> {
+        let n = (secs * 48_000.0) as usize;
+        let mut out = [0.0; 480];
+        let mut reports = Vec::new();
+        for k in (0..n).step_by(480) {
+            let x: Vec<f64> = (k..k + 480).map(|i| input.get(i).copied().unwrap_or(0.0)).collect();
+            st.process(&x, &mut out);
+            while let Some(r) = st.pop() {
+                reports.push(r);
+            }
+        }
+        reports
+    }
+
+    fn autotunes(r: &[Report]) -> Vec<Autotune> {
+        r.iter().filter_map(|r| if let Report::Autotune(a) = r { Some(a.clone()) } else { None }).collect()
+    }
+
+    #[test]
+    fn autotune_takes_the_drive_the_other_station_picks() {
+        let mut st = Station::new(fm::Config::new(FmBandwidth::Narrow, "HB9TOB"), Options::default());
+        st.autotune("hb9ak-4").unwrap();
+        assert!(st.autotune("HB9AK-4").is_err(), "one at a time");
+        // HB9AK-4's answer as recorded on the air: step 5, S/N 27.4 dB
+        let reply =
+            xara_testkit::hex::decode("62484239414b20200420202020202020002020202020202000484239544f422000c014010082e8")
+                .unwrap();
+        let m = Modulator::new(FmBandwidth::Narrow);
+        let mut r = |n: u32| n / 2;
+        let opt = TxOptions { drive_db: -10.0, pre_signal: false };
+        let answer = m.transmission(Record::Connect, 0, &[&reply], xara_phy::fm::tx::CONNECT_LEAD_IN, opt, &mut r);
+        let sent = run(&mut st, &[], 15.0);
+        assert_eq!(autotunes(&sent), [Autotune::Sent { peer: "HB9AK-4".into() }]);
+        assert!(!st.ptt());
+        let mut heard = vec![0.0; 9_600];
+        heard.extend(answer);
+        let got = run(&mut st, &heard, 3.0);
+        let Some(Autotune::Done { peer, step, drive_db, snr_db, .. }) = autotunes(&got).pop() else {
+            panic!("no result: {got:?}")
+        };
+        assert_eq!((peer.as_str(), step, drive_db), ("HB9AK-4", 5, -15.0));
+        assert!((snr_db - 27.4).abs() < 0.05);
+        assert_eq!(st.options().drive_db, -15.0);
+        assert!(st.idle());
+    }
+
+    #[test]
+    fn autotune_gives_up_without_an_answer() {
+        let mut st = Station::new(fm::Config::new(FmBandwidth::Narrow, "HB9TOB"), Options::default());
+        st.autotune("HB9AK-4").unwrap();
+        let r = run(&mut st, &[], 15.0 + secs(AUTOTUNE_WAIT) + 1.0);
+        assert_eq!(autotunes(&r).last(), Some(&Autotune::NoReply { peer: "HB9AK-4".into() }));
+        assert_eq!(st.options().drive_db, Options::default().drive_db);
+        assert!(st.idle());
+    }
 
     #[test]
     fn link_level_is_a_data_level() {

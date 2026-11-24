@@ -180,3 +180,32 @@ fn record0_relay_keeps_received_compression_and_aes_bits() {
     assert_eq!(r.to_bytes().unwrap()[34], 0x48);
     assert_eq!(r.restamp(&raw)[34], 0xCC);
 }
+
+// Recorded on the air: VARA FM 4.4.1 (HB9TOB) autotuning with HB9AK-4, which picked step 4 at
+// S/N 26.7 dB, and again with less audio gain, step 5 at 27.4 dB.
+const AUTOTUNE_STEP1: &str = "20484239544f42200020202020202020002020202020202000484239414b20200401000100b194";
+const AUTOTUNE_STEP10: &str = "20484239544f42200020202020202020002020202020202000484239414b2020040a000100af8b";
+const AUTOTUNE_REPLY_STEP4: &str = "62484239414b20200420202020202020002020202020202000484239544f422000bb1001000242";
+const AUTOTUNE_REPLY_STEP5: &str = "62484239414b20200420202020202020002020202020202000484239544f422000c014010082e8";
+
+#[test]
+fn autotune_frames_are_vara_s() {
+    use xara_phy::fm::frame::autotune_request;
+    assert_eq!(hex::encode(autotune_request("HB9TOB", "HB9AK-4", 1).unwrap()), AUTOTUNE_STEP1);
+    assert_eq!(hex::encode(autotune_request("HB9TOB", "HB9AK-4", 10).unwrap()), AUTOTUNE_STEP10);
+    let r = Record0::parse(&hex::decode(AUTOTUNE_STEP1).unwrap()).unwrap();
+    assert_eq!((r.kind, r.source.as_str(), r.target.as_str()), (Kind::AutoTune, "HB9TOB", "HB9AK-4"));
+}
+
+#[test]
+fn autotune_replies_give_the_step_and_snr() {
+    use xara_phy::fm::frame::AutotuneReply;
+    let a = AutotuneReply::parse(&hex::decode(AUTOTUNE_REPLY_STEP4).unwrap()).unwrap();
+    assert_eq!((a.source.as_str(), a.target.as_str(), a.wide), ("HB9AK-4", "HB9TOB", true));
+    assert_eq!((a.step, a.verdict, a.drive_db()), (4, 0, Some(-18.0)));
+    assert!((a.snr_db - 26.7).abs() < 0.05, "{}", a.snr_db);
+    let b = AutotuneReply::parse(&hex::decode(AUTOTUNE_REPLY_STEP5).unwrap()).unwrap();
+    assert_eq!((b.step, b.drive_db()), (5, Some(-15.0)));
+    assert!((b.snr_db - 27.4).abs() < 0.05, "{}", b.snr_db);
+    assert_eq!(AutotuneReply::parse(&hex::decode(AUTOTUNE_STEP1).unwrap()), None);
+}
