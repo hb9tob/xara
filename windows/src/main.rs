@@ -69,7 +69,8 @@ impl Modem {
         let Some(m) = self.handle.take() else { return };
         let code = m.stop();
         self.drain();
-        self.status = if code == 0 { "Stopped".into() } else { format!("Stopped (exit {code}): {}", self.last_error()) };
+        self.status =
+            if code == 0 { "Stopped".into() } else { format!("Stopped (exit {code}): {}", self.last_error()) };
     }
 
     fn last_error(&self) -> String {
@@ -127,6 +128,8 @@ struct App {
     tray_on: Option<bool>,
     hwnd_known: bool,
     status: Latest,
+    /// The last autotune whose drive was saved to the settings
+    autotune_saved: std::cell::Cell<u64>,
 }
 
 /// Set by the tray's Quit: the window lets itself close.
@@ -159,6 +162,7 @@ impl App {
             tray_on: None,
             hwnd_known: false,
             status,
+            autotune_saved: std::cell::Cell::new(0),
         };
         app.refresh_devices();
         app.pick_default_devices();
@@ -475,8 +479,11 @@ impl App {
             } else {
                 ("TUNE".to_string(), Color32::from_rgb(31, 111, 235))
             };
-            let b = egui::Button::new(RichText::new(label).strong().color(Color32::WHITE)).fill(fill).min_size(egui::vec2(130.0, 26.0));
-            if ui.add(b).on_hover_text("A steady carrier for at most 20 s, to set the radio's ALC and power").clicked() {
+            let b = egui::Button::new(RichText::new(label).strong().color(Color32::WHITE))
+                .fill(fill)
+                .min_size(egui::vec2(130.0, 26.0));
+            if ui.add(b).on_hover_text("A steady carrier for at most 20 s, to set the radio's ALC and power").clicked()
+            {
                 xara_ffi::tune(!st.tuning);
             }
             ui.label("TX drive");
@@ -489,17 +496,80 @@ impl App {
                 let _ = s.save();
             }
         });
-        let radio = self.settings.lock().unwrap_or_else(PoisonError::into_inner).radio;
+        let (radio, fm) = {
+            let s = self.settings.lock().unwrap_or_else(PoisonError::into_inner);
+            (s.radio, !s.is_hf())
+        };
         note(
             ui,
-            if radio {
-                "Tune keys the transmitter: use a clear frequency (not a calling frequency) or a dummy load. \
-                 For digital modes turn the drive down until the ALC barely moves."
-            } else {
-                "Without radio mode the tune carrier only goes into the virtual device."
+            match (radio, fm) {
+                (false, _) => "Without radio mode the tune carrier only goes into the virtual device.",
+                (true, false) => {
+                    "Tune keys the transmitter: use a clear frequency (not a calling frequency) or a dummy load. \
+                     For digital modes turn the drive down until the ALC barely moves."
+                }
+                (true, true) => {
+                    "Tune keys the transmitter: use a clear frequency or a dummy load. In FM the ALC says \
+                     nothing about deviation: use Autotune below, or listen on a second receiver."
+                }
             },
         );
+        if fm {
+            self.autotune_row(ui, &st);
+        }
         ui.add_space(4.0);
+    }
+
+    /// VARA FM's autotune: ten steps of drive to another station (a VARA FM gateway or user),
+    /// which sends back the one it heard best; that becomes the drive.
+    fn autotune_row(&self, ui: &mut egui::Ui, st: &status::Status) {
+        let a = st.autotune.as_ref();
+        let busy = a.is_some_and(|a| a.state == "sending" || a.state == "waiting");
+        if let Some(a) = a.filter(|a| a.state == "done" && a.seq != self.autotune_saved.get()) {
+            self.autotune_saved.set(a.seq);
+            if let Some(d) = a.drive {
+                let mut s = self.settings.lock().unwrap_or_else(PoisonError::into_inner);
+                s.drive_db = d as f32;
+                let _ = s.save();
+            }
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Autotune with");
+            let mut s = self.settings.lock().unwrap_or_else(PoisonError::into_inner);
+            let before = s.autotune_peer.clone();
+            ui.add(egui::TextEdit::singleline(&mut s.autotune_peer).desired_width(90.0).hint_text("HB9AK-4"));
+            let peer = s.autotune_peer.trim().to_uppercase();
+            let ready = !busy && !st.tuning && !st.ptt && st.state == "Listen" && !peer.is_empty();
+            let b = egui::Button::new(RichText::new("AUTOTUNE").strong().color(Color32::WHITE))
+                .fill(Color32::from_rgb(31, 111, 235))
+                .min_size(egui::vec2(110.0, 24.0));
+            let hint = "Sends 10 frames at drives from -30 to 0 dB to that station, which answers with the \
+                        one it heard best; xara then uses that drive (as VARA FM's Autotune)";
+            if ui.add_enabled(ready, b).on_hover_text(hint).clicked() {
+                xara_ffi::autotune(&peer);
+            }
+            if s.autotune_peer != before {
+                let _ = s.save();
+            }
+        });
+        if let Some(a) = a {
+            let text = match a.state.as_str() {
+                "sending" => format!("Sending the 10 steps to {}…", a.peer),
+                "waiting" => format!("Waiting for {}'s answer…", a.peer),
+                "done" => format!(
+                    "{} picked {} dB (step {}/10), S/N {} dB: drive set",
+                    a.peer,
+                    a.drive.map_or("?".into(), |d| format!("{d:.0}")),
+                    a.step,
+                    a.sn.map_or("?".into(), |v| format!("{v:+.1}"))
+                ),
+                _ => format!("No answer from {}", a.peer),
+            };
+            let colour =
+                if a.state == "no reply" { Color32::from_rgb(220, 120, 30) } else { ui.visuals().text_color() };
+            ui.label(RichText::new(text).color(colour));
+        }
     }
 
     fn web_tab(&mut self, ui: &mut egui::Ui) {
@@ -534,7 +604,11 @@ impl App {
                     if received { m.received.clear() } else { m.log.clear() }
                 }
                 if ui.button("Copy").clicked() {
-                    let text = if received { m.received.clone() } else { m.log.iter().cloned().collect::<Vec<_>>().join("\n") };
+                    let text = if received {
+                        m.received.clone()
+                    } else {
+                        m.log.iter().cloned().collect::<Vec<_>>().join("\n")
+                    };
                     ui.ctx().copy_text(text);
                 }
             });
@@ -559,8 +633,11 @@ impl App {
 /// A status pill: lit in `color` when on.
 fn badge(ui: &mut egui::Ui, text: &str, on: bool, color: Color32) {
     let (fg, bg) = if on { (Color32::WHITE, color) } else { (Color32::GRAY, Color32::TRANSPARENT) };
-    egui::Frame::none().fill(bg).stroke(egui::Stroke::new(1.0_f32, if on { color } else { Color32::GRAY }))
-        .rounding(4.0).inner_margin(egui::Margin::symmetric(6.0, 1.0))
+    egui::Frame::none()
+        .fill(bg)
+        .stroke(egui::Stroke::new(1.0_f32, if on { color } else { Color32::GRAY }))
+        .rounding(4.0)
+        .inner_margin(egui::Margin::symmetric(6.0, 1.0))
         .show(ui, |ui| ui.label(RichText::new(text).color(fg).strong().size(12.0)));
 }
 
@@ -634,7 +711,11 @@ fn clients_note(s: &Settings) -> String {
     format!(
         "Clients elsewhere on the network connect to {}. Anyone on this network can use the modem. \
          Windows Firewall may ask to allow xara the first time.",
-        if hosts.is_empty() { "this PC".to_string() } else { hosts.iter().map(|h| format!("{h}:{}", s.port)).collect::<Vec<_>>().join(", ") }
+        if hosts.is_empty() {
+            "this PC".to_string()
+        } else {
+            hosts.iter().map(|h| format!("{h}:{}", s.port)).collect::<Vec<_>>().join(", ")
+        }
     )
 }
 

@@ -146,3 +146,37 @@ fn tune_block_is_vara_fm_tune_tone() {
     let at_1500 = |n: usize| (2.0 * std::f64::consts::PI * 1500.0 * n as f64 / 48_000.0).cos() * x[0];
     assert!((0..NFFT).all(|n| (x[n] - at_1500(n)).abs() < 1e-12));
 }
+
+#[test]
+fn autotune_is_vara_fm_s_ten_steps() {
+    use xara_phy::fm::frame::{Kind, Record0};
+    use xara_phy::fm::rx::receiver::{Event, Receiver};
+    use xara_phy::fm::tx::{AUTOTUNE_PERIOD, NCP, NFFT};
+    let m = Modulator::new(FmBandwidth::Narrow);
+    let mut seed = 1u32;
+    let mut rand = |n: u32| {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        (seed >> 8) % n
+    };
+    let x = m.autotune("HB9TOB", "HB9AK-4", &mut rand).unwrap();
+    let frame = 53 * (NFFT + NCP);
+    assert_eq!(x.len(), 9 * AUTOTUNE_PERIOD + frame);
+    // Each step's level as VARA FM 4.4.1 sent it (rms dBFS, measured on its output)
+    let vara = [-40.7, -35.7, -31.7, -28.7, -25.7, -22.7, -19.7, -16.7, -13.7, -10.7];
+    for (k, want) in vara.into_iter().enumerate() {
+        let s = &x[k * AUTOTUNE_PERIOD..k * AUTOTUNE_PERIOD + frame];
+        let rms = 10.0 * (s.iter().map(|v| v * v).sum::<f64>() / s.len() as f64).log10();
+        assert!((rms - want).abs() < 0.3, "step {}: {rms:.2} dBFS, VARA {want}", k + 1);
+        assert!(x[k * AUTOTUNE_PERIOD + frame..((k + 1) * AUTOTUNE_PERIOD).min(x.len())].iter().all(|&v| v == 0.0));
+    }
+    let mut rx = Receiver::new(FmBandwidth::Narrow, 0, &[Record::Connect], 1);
+    let padded: Vec<f64> = x.iter().copied().chain(std::iter::repeat_n(0.0, 48_000)).collect();
+    let mut ev: Vec<Event> = padded.chunks(480).flat_map(|b| rx.feed(b)).collect();
+    ev.extend(rx.flush());
+    let steps: Vec<u8> = ev
+        .iter()
+        .filter_map(|e| if let Event::Tx(t) = e { t.frames.first().filter(|f| f.ok) } else { None })
+        .filter_map(|f| Record0::parse(&f.bytes).filter(|r| r.kind == Kind::AutoTune).map(|_| f.bytes[33]))
+        .collect();
+    assert_eq!(steps, (1..=10).collect::<Vec<u8>>());
+}

@@ -50,6 +50,8 @@ pub struct Settings {
     pub record_audio: bool,
     /// Kept across launches, so a bookmarked controlling web UI keeps working.
     pub ui_token: String,
+    /// The station last asked for an FM autotune.
+    pub autotune_peer: String,
 }
 
 impl Default for Settings {
@@ -80,6 +82,7 @@ impl Default for Settings {
             debug_log: false,
             record_audio: false,
             ui_token: String::new(),
+            autotune_peer: String::new(),
         }
     }
 }
@@ -163,7 +166,12 @@ impl Settings {
         a.extend(["--audio", "wasapi", "--capture", capture, "--playback", &self.playback].map(String::from));
         if self.radio {
             a.extend(["--radio".into(), "--ptt".into(), self.ptt_option()]);
-            a.extend(["--ptt-lead-ms".into(), self.lead_ms.to_string(), "--ptt-tail-ms".into(), self.tail_ms.to_string()]);
+            a.extend([
+                "--ptt-lead-ms".into(),
+                self.lead_ms.to_string(),
+                "--ptt-tail-ms".into(),
+                self.tail_ms.to_string(),
+            ]);
         }
         a.extend(["--drive-db".into(), format!("{:.1}", self.drive_db)]);
         a.extend(["--addr".into(), bind.into(), "--port".into(), self.port.to_string()]);
@@ -191,9 +199,7 @@ impl Settings {
             a.extend(["--debug-log".into(), logs_dir().join("debug.log").to_string_lossy().into_owned()]);
         }
         if self.record_audio {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
             let f = logs_dir().join(format!("xara-{stamp}.flac"));
             a.extend(["--record".into(), f.to_string_lossy().into_owned()]);
         }
