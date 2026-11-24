@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - VARA FM autotune, the asking side: ten record 0 frames at drives from -30 to
   0 dB to another station, which answers with the one it heard best and its
